@@ -1,5 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+import backend.Youtube_Q_A_bot as yt_bot
+from backend.Youtube_Q_A_bot import TranscriptNotAvailableError
 
 app = FastAPI()
 
@@ -16,13 +19,17 @@ class QuestionRequest(BaseModel):
 def video_link_from(data: VideoRequest):
     global vector_db, rag_chain
 
-    import backend.Youtube_Q_A_bot
+    try:
+        transcript, video_id = yt_bot.preprocess(data.video_link)
+    except TranscriptNotAvailableError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    transcript = backend.Youtube_Q_A_bot.preprocess(data.video_link)
-    chunks = backend.Youtube_Q_A_bot.text_chunk(transcript)
-    vector_db = backend.Youtube_Q_A_bot.local_db(chunks)
-    retriever, prompt = backend.Youtube_Q_A_bot.instruct(vector_db)
-    rag_chain = backend.Youtube_Q_A_bot.generate(retriever, prompt)
+    chunks = yt_bot.text_chunk(transcript)
+    vector_db = yt_bot.local_db(chunks, video_id)
+    retriever, prompt = yt_bot.instruct(vector_db)
+    rag_chain = yt_bot.generate(retriever, prompt)
 
     return {"message": "Video processed successfully"}
 
@@ -32,7 +39,7 @@ def predict(data: QuestionRequest):
     global rag_chain
 
     if rag_chain is None:
-        return {"error": "Video not loaded yet"}
+        raise HTTPException(status_code=400, detail="Video not loaded yet")
 
     response = rag_chain.invoke(data.question)
 
