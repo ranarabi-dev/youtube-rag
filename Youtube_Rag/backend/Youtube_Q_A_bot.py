@@ -1,6 +1,7 @@
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 import os
-import sys
+from urllib.parse import urlparse, parse_qs
+from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Chroma
@@ -9,89 +10,99 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.documents import Document
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 
-os.environ["GOOGLE_API_KEY"] = "API key here "       # setting the gemini api key, if you are in colab 
+load_dotenv() 
+
+
+class TranscriptNotAvailableError(Exception):
+    """Raised when a video has no usable transcript."""
+    pass
+
+
+def extract_video_id(video_link: str) -> str:
+    """Parses the actual URL structure instead of guessing from substrings —
+    handles /watch, youtu.be, /shorts/, /embed/, /live/ correctly, including
+    extra query params like &t=30s."""
+    parsed = urlparse(video_link)
+
+    if parsed.hostname in ("youtu.be",):
+        return parsed.path.lstrip("/")
+
+    if parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
+        if parsed.path == "/watch":
+            query = parse_qs(parsed.query)
+            if "v" in query:
+                return query["v"][0]
+        if parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
+            return parsed.path.split("/")[2]
+
+    raise ValueError(f"Could not extract a video ID from: {video_link}")
+
 
 def preprocess(user_link):
+    """Now returns (fetch_text, video_id) instead of just fetch_text —
+    video_id is needed downstream to scope the vector store per video."""
     fetch_text = []
 
-    video_link = user_link
-
-    video_id = ''
-    if 'list' in video_link:
-        video_id+= video_link.split('=')[1].split('&')[0]
-    elif '.be/' in video_link:
-        video_id +=video_link.split('.be/')[1].split('?')[0]
-    else:
-        video_id+= video_link.split('=')[1]
-
+    video_id = extract_video_id(user_link)
 
     y_t_api = YouTubeTranscriptApi()
 
-    try: 
+    try:
         fetch_trans = y_t_api.fetch(video_id, languages=['en'])
     except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
-        print('Subtitles not available ...')
-        sys.exit()
-
-
+        raise TranscriptNotAvailableError(
+            f"Subtitles not available for video: {video_id}"
+        )
 
     for i in fetch_trans:
         fetch_text.append(i.text)
 
-    return fetch_text
-
-
-
+    return fetch_text, video_id
 
 
 def text_chunk(fetch_text):
     print("Chunking text...")
 
-    full_transcript = " ".join(fetch_text)    # Join all transcript lines into one large string to allow proper chunking
+    full_transcript = " ".join(fetch_text)
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=600,
         chunk_overlap=50
     )
 
-    documents = [Document(page_content=full_transcript)] 
-    chunks = text_splitter.split_documents(documents)       # Spliting the  document into chunks
+    documents = [Document(page_content=full_transcript)]
+    chunks = text_splitter.split_documents(documents)
 
     print(f"Created {len(chunks)} chunks.")
 
     return chunks
 
 
+def local_db(chunks, video_id: str):
+    """Now requires video_id — scopes each video into its own Chroma
+    collection so questions about one video can't retrieve chunks from
+    another (this was the cross-video contamination bug)."""
+    print(f"Creating local vector database for video {video_id}...")
 
+    local_embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
+    collection_name = f"video_{video_id}"
 
-
-def local_db(chunks):
-    print("Creating local vector database using SentenceTransformer embeddings...")
-
-    local_embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")     # select huggingface embedding model 
-
-    # Recreate the vector database with the local embeddings
     vector_db_local = Chroma.from_documents(
         documents=chunks,
         embedding=local_embeddings,
-        persist_directory="/app/backend/chroma_db_local" # directory path 
+        collection_name=collection_name,
+        persist_directory="/app/backend/chroma_db_local"
     )
-    print("local Vector database created successfully using SentenceTransformer.")
+
+    print(f"Local vector database created for video {video_id}.")
 
     return vector_db_local
 
 
-
-
-
-
 def instruct(vector_db_local):
+    retriever = vector_db_local.as_retriever(search_kwargs={"k": 2})
 
-# Configure the database to act as a document retriever
-    retriever = vector_db_local.as_retriever(search_kwargs={"k": 2})    # k , is for getting simila chunks     
-
-    # Defineing the hidden prompt structure for the LLM
     template = """
     Use the following pieces of retrieved context to answer the question.
     If you don't know the answer, just say that you don't know.
@@ -106,23 +117,15 @@ def instruct(vector_db_local):
     return retriever, prompt
 
 
-
-
-
-
-
 def generate(retriever, prompt):
-        #  model needs to e change according to api_key 
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
 
-    # Helper function to stitch retrieved chunks into a single text block
-    def format_docs(docs):      # formating chunk into text , so model can read it 
+    def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
 
-    # Connect everything together using LangChain Expression Language (LCEL)
-    rag_chain = (           
-        {"context": retriever | format_docs, 
-        "question": RunnablePassthrough()}
+    rag_chain = (
+        {"context": retriever | format_docs,
+         "question": RunnablePassthrough()}
         | prompt
         | llm
     )
@@ -130,10 +133,7 @@ def generate(retriever, prompt):
     return rag_chain
 
 
-
-
 def user_input(user_question, rag_chain):
-
     response = rag_chain.invoke(user_question)
 
     if hasattr(response, "content"):
